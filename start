@@ -1,0 +1,153 @@
+#!/usr/bin/env node
+
+"use strict";
+
+var Promise = require("bluebird");
+var path = require("path");
+var request = require("request-promise");
+var sentenceSplitter = require("sentence-splitter");
+var twitter = require("twitter");
+var wikijs = require("wikijs");
+var fs = require("fs");
+
+var MAX_CHARACTERS = 280;
+var MINUTES_BETWEEN_TWEETS = 2*60;
+
+var secrets = JSON.parse(fs.readFileSync("secrets.json", "utf8"));
+var client = new twitter({
+    consumer_key: secrets.consumer_key,
+    consumer_secret: secrets.consumer_secret,
+    access_token_key: secrets.access_token_key,
+    access_token_secret: secrets.access_token_secret,
+});
+Promise.promisifyAll(client);
+
+var wiki = wikijs.default();
+
+var lastTweetId = null;
+
+var truncate = function (str, maxLength) {
+    if (str.length > maxLength) {
+        var ellipses = "...";
+        str = str.substr(0, maxLength-ellipses.length)+ellipses;
+    }
+    return str;
+};
+
+var getBestImage = function (page) {
+    var allImages = [];
+    return page.mainImage().then(function (image) {
+        allImages.push(image);
+    }).catch(function () {}).then(function () {
+        return page.images().then(function (images) {
+            allImages = allImages.concat(images);
+        });
+    }).then(function () {
+        for (var ii = 0; ii < allImages.length; ++ii) {
+            var image = allImages[ii];
+            if (path.extname(image.toLowerCase()) != ".svg") {
+                return image;
+            }
+        }
+        return null;
+    });
+};
+
+var getRandomTitle = function () {
+    return wiki.random(1).then(function (result) {
+        return result[0];
+    });
+};
+
+var tweet = function (text, imageUrl, coords) {
+    console.log("Tweet: "+text);
+    console.log("Image: "+imageUrl);
+    console.log("Coords: ",coords);
+
+    var getMedia = (imageUrl != null)
+        ? request(imageUrl, {encoding: null}).then(function (buffer) {
+            if (buffer.length < 3145728) {
+                return client.postAsync("media/upload", {media: buffer});
+            }
+        })
+        : Promise.resolve(null);
+
+    return getMedia.catch(function (error) {
+        console.error("Error uploading image: "+error.message);
+    }).then(function (media) {
+        // console.log("MEDIA", media);
+        var opts = {
+            status: text,
+        };
+        if (media != null) {
+            opts.media_ids = media.media_id_string;
+        }
+        if (coords != null) {
+            opts.lat = coords.lat;
+            opts.long = coords.lon;
+            opts.display_coordinates = true;
+        }
+        if (lastTweetId != null) {
+            opts.in_reply_to_status_id = lastTweetId;
+        }
+        return client.postAsync("statuses/update", opts).then(function (result) {
+            lastTweetId = result.id_str;
+        });
+    }).catch(function (error) {
+        console.log("Error sending tweet: ", error);
+    });
+};
+
+var step = function (title) {
+    console.log("Stepping to "+title);
+    return wiki.page(title).then(function (page) {
+        var summary = page.raw.title;
+        var url = page.raw.canonicalurl.replace("https://en.wikipedia.org/wiki/", "https://enwp.org/");
+
+        return page.summary().then(function (content) {
+            var blocks = sentenceSplitter.split(content);
+            for (var ii = 0; ii < blocks.length; ++ii) {
+                var block = blocks[ii];
+                if (block.type == "Sentence") {
+                    summary = block.value;
+                    break;
+                }
+            }
+            return getBestImage(page);
+
+        }).then(function (image) {
+            return page.coordinates().catch(function () {}).then(function (coords) {
+                var text = summary.replace(new RegExp("\\b"+page.raw.title+"\\b", "i"), url);
+                if (text == summary) {
+                    text = truncate(text, MAX_CHARACTERS-url.length-1) + " " + url;
+                } else {
+                    text = truncate(text, MAX_CHARACTERS);
+                }
+                return tweet(text, image, coords);
+            });
+
+        }).then(function () {
+            return page.links().then(function (links) {
+                return (links.length > 0)
+                    ? links[Math.floor(Math.random()*links.length)]
+                    : getRandomTitle();
+            });
+        }).then(function (nextTitle) {
+            setTimeout(function () {
+                step(nextTitle);
+            }, MINUTES_BETWEEN_TWEETS*60*1000);
+        });
+
+    }).catch(function (error) {
+        console.error(error);
+        console.error(error.stack);
+        process.exit(1);
+    });
+};
+
+// step("International Standard Book Number");
+// step("Texas");
+// step("Michael Penn");
+getRandomTitle().then(function (title) {
+    step(title);
+});
